@@ -1,0 +1,15 @@
+#![allow(dead_code)]
+#[path="../src/gpu.rs"]mod gpu;#[path="../src/weights.rs"]mod weights;
+use anyhow::{Result,ensure};use gpu::{Gpu,Enc,Buf};use weights::{Weights,Linear};use objc2_metal::{MTLBuffer,MTLCommandBuffer};
+fn bytes(b:&Buf)->&[u8]{unsafe{std::slice::from_raw_parts(b.contents().as_ptr().cast(),b.length())}}
+fn diff(a:&Buf,b:&Buf)->usize{bytes(a).chunks_exact(2).zip(bytes(b).chunks_exact(2)).filter(|(a,b)|a!=b).count()}
+fn next(s:&mut u64)->u64{*s^=*s<<13;*s^=*s>>7;*s^=*s<<17;*s}
+fn random(n:usize,s:&mut u64,scale:f32)->Vec<u8>{let mut v=Vec::with_capacity(n*2);for _ in 0..n{let x=(((next(s)>>40)as f32/(1u32<<23)as f32)-1.0)*scale;v.extend_from_slice(&((x.to_bits()>>16)as u16).to_le_bytes());}v}
+fn run<F:FnMut(&Enc)>(g:&Gpu,n:usize,mut f:F)->Result<f64>{let(c,e)=g.begin()?;for _ in 0..n{f(&e);}let c=Gpu::commit(c,e);Gpu::wait(&c)?;Ok((c.GPUEndTime()-c.GPUStartTime())*1e6/n as f64)}
+struct Out{logits:Buf,max:Buf,sum:Buf,token:Buf}impl Out{fn new(g:&Gpu)->Result<Self>{Ok(Self{logits:g.buffer(248320*2)?,max:g.buffer(4096)?,sum:g.buffer(4096)?,token:g.buffer(4)?})}}
+fn dispatch(g:&Gpu,e:&Enc,w:&Linear,x:&Buf,o:&Out,name:&str){g.dispatch(e,name,&[(&w.w,0),(&w.s,0),(&w.b,0),(x,0),(&o.logits,0),(&o.max,0),(&o.sum,0)],&[1,248320,1024],[128,1,1],[256,1,1]);g.dispatch(e,"head_lse_tail",&[(&o.logits,0),(&o.max,0),(&o.sum,0),(&o.token,0)],&[248320],[1,1,1],[1024,1,1]);}
+fn main()->Result<()>{let args:Vec<String>=std::env::args().collect();let bench=args[1]=="bench";let mut g=Gpu::new()?;g.compile(include_str!("../src/kernels/head_lse.metal"),&["head_lse_g8","head_lse_tail"])?;let names=["head_lse_g8","head_lse_g8_preload","head_lse_g8_vector","head_lse_g8_preload_vector"];g.compile(include_str!("head_preload_005.metal"),&names[1..])?;
+let mut ws=Weights::load(&g,std::path::Path::new(&args[2]))?;let w=ws.linear("embed_tokens",248320,1024)?;let a=Out::new(&g)?;let b=Out::new(&g)?;let mut seed=0x782e7ac563;
+for trial in 0..if bench{1}else{8}{for scale in if bench{vec![1.0]}else{vec![0.0,0.001,0.1,1.0,10.0,100.0]}{let x=g.from_bytes(&random(1024,&mut seed,scale))?;run(&g,1,|e|dispatch(&g,e,&w,&x,&a,names[0]))?;for name in &names[1..]{run(&g,1,|e|dispatch(&g,e,&w,&x,&b,name))?;let ld=diff(&a.logits,&b.logits);let md=diff(&a.max,&b.max);let sd=diff(&a.sum,&b.sum);let td=diff(&a.token,&b.token);println!("{}",serde_json::json!({"check":"head_preload","trial":trial,"scale":scale,"variant":name,"logits_diff":ld,"max_diff":md,"sum_diff":sd,"token_diff":td}));ensure!(ld+md+sd+td==0,"head differs");}
+if bench{for name in &names{run(&g,8,|e|dispatch(&g,e,&w,&x,&b,name))?;}for round in 0..16{let mut vv=names.to_vec();if round%2==1{vv.reverse();}for name in vv{let us=run(&g,64,|e|dispatch(&g,e,&w,&x,&b,name))?;println!("{}",serde_json::json!({"bench":"head_preload","variant":name,"round":round,"us":us}));}}}
+}}Ok(())}
